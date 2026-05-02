@@ -1,0 +1,50 @@
+##########################
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y python3 python3-pip git curl
+##########################
+sudo apt install -y ansible
+ansible --version
+##########################
+curl -fsSL https://ollama.com/install.sh | sh
+
+ollama serve
+
+ollama pull llama3
+
+ollama run llama3
+##########################
+mkdir ansible-ai-agent
+cd ansible-ai-agent
+python3 -m venv venv
+source venv/bin/activate
+##########################
+pip install langchain ollama subprocess.run
+
+pip install --upgrade langchain langchain-community langchain-core
+pip install langchain-ollama
+##########################
+
+mkdir playbooks
+cd playbooks
+
+
+##########################
+
+nano install_nginx.yml
+
+
+
+
+- name: Install nginx
+  hosts: localhost
+  become: yes
+
+  tasks:
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present
+
+##########################
+        
