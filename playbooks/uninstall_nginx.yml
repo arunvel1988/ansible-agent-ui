@@ -1,0 +1,17 @@
+- name: Uninstall nginx
+  hosts: localhost
+  become: yes
+
+  tasks:
+    - name: Stop nginx service
+      service:
+        name: nginx
+        state: stopped
+      ignore_errors: yes
+
+    - name: Remove nginx package
+      apt:
+        name: nginx
+        state: absent
+        purge: yes
+        autoremove: yes
