@@ -1,23 +1,23 @@
 import subprocess
 import tempfile
 import yaml
-import re
 from langchain_ollama import OllamaLLM
 
+# ---------------- LLM ----------------
 llm = OllamaLLM(model="llama3")
 
 chat_history = []
 
 
-# ---------------- CLEAN LLM OUTPUT ----------------
-def clean_yaml_output(text):
+# ---------------- CLEAN OUTPUT ----------------
+def clean_yaml(text):
     text = text.strip()
 
     if "```" in text:
         parts = text.split("```")
-        for part in parts:
-            if "- name:" in part:
-                text = part.replace("yaml", "").strip()
+        for p in parts:
+            if "- name:" in p:
+                text = p.replace("yaml", "").strip()
                 break
 
     if "- name:" in text:
@@ -26,86 +26,7 @@ def clean_yaml_output(text):
     return text.strip()
 
 
-# ---------------- INTENT EXTRACTION ----------------
-def extract_user_task(user_input):
-    match = re.search(r"user\s+(\w+)", user_input.lower())
-    username = match.group(1) if match else "testuser"
-
-    return {
-        "name": f"Create user {username}",
-        "user": {
-            "name": username,
-            "password": "{{ '123' | password_hash('sha512') }}",
-            "groups": "sudo",
-            "append": True
-        }
-    }
-
-
-# ---------------- SANITIZER ----------------
-def sanitize_playbook(playbook, user_input):
-    play = playbook[0]
-
-    clean_play = {
-        "name": play.get("name", "Play"),
-        "hosts": "localhost",
-        "become": True
-    }
-
-    tasks = play.get("tasks", [])
-    clean_tasks = []
-
-    for task in tasks:
-        if not isinstance(task, dict):
-            continue
-
-        new_task = {"name": task.get("name", "Task")}
-
-        for key, value in task.items():
-            if key == "name":
-                continue
-
-            # -------- USER FIX --------
-            if key == "user" and isinstance(value, dict):
-                if "sudo" in value:
-                    value.pop("sudo")
-                    value["groups"] = "sudo"
-                    value["append"] = True
-
-                if "password" in value:
-                    value["password"] = "{{ '123' | password_hash('sha512') }}"
-
-                new_task["user"] = value
-
-            # -------- COMMAND FIX --------
-            elif key in ["command", "shell"]:
-                new_task[key] = value
-                new_task["register"] = "cmd_output"
-
-            else:
-                new_task[key] = value
-
-        # keep valid tasks only
-        if len(new_task) > 1:
-            clean_tasks.append(new_task)
-
-    # 🚨 NEVER allow empty tasks
-    if not clean_tasks:
-        clean_tasks.append(extract_user_task(user_input))
-
-    # show output if command used
-    if any("command" in t or "shell" in t for t in clean_tasks):
-        clean_tasks.append({
-            "name": "Show command output",
-            "debug": {"var": "cmd_output.stdout"}
-        })
-
-    clean_play["tasks"] = clean_tasks
-
-    return [clean_play]
-
-
-# ---------------- PARSE ----------------
+# ---------------- PARSE YAML ----------------
 def parse_yaml(text):
     try:
         data = yaml.safe_load(text)
@@ -125,7 +46,7 @@ def is_safe(text):
     return True, None
 
 
-# ---------------- ANSIBLE ----------------
+# ---------------- ANSIBLE EXECUTION ----------------
 def run(cmd):
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout if result.stdout else result.stderr
@@ -143,23 +64,41 @@ def execute(path):
     return run(["ansible-playbook", path])
 
 
-# ---------------- LLM ----------------
+# ---------------- LLM PROMPT ----------------
 def generate(user_input, history, error=None):
     prompt = f"""
-You are an expert Ansible automation engine.
+You are an Ansible expert AI.
 
-STRICT:
-- Output ONLY YAML
-- No markdown
-- Must start with '- name:'
+Decide request type:
 
-RULES:
-- Valid modules only
-- Correct parameters
+1. PLAYBOOK GENERATION
+- If user asks to perform a task → output ONLY YAML playbook
 
-IMPORTANT:
-- user module does NOT support sudo
-- use groups: sudo
+2. ANSIBLE KNOWLEDGE
+- If user asks concept → output TEXT explanation
+
+3. NON-ANSIBLE
+- If unrelated → output EXACTLY:
+INVALID REQUEST: ONLY ANSIBLE SUPPORTED
+
+PLAYBOOK RULES:
+- MUST start with '- name:'
+- Use proper YAML indentation
+- hosts: localhost
+- become: true when needed
+- Use valid Ansible modules ONLY
+- NO markdown
+- NO ``` blocks
+
+USER MODULE:
+- DO NOT use sudo param
+- Use:
+  groups: sudo
+  append: true
+
+COMMAND RULE:
+- Use 'command'
+- Add register + debug ONLY if output needed
 
 Conversation:
 {history}
@@ -169,25 +108,34 @@ User:
 """
 
     if error:
-        prompt += f"\n\nFix this error:\n{error}"
+        prompt += f"\nFix this error:\n{error}"
 
     return llm.invoke(prompt).strip()
 
 
-# ---------------- AUTO REPAIR LOOP ----------------
+# ---------------- AUTO REPAIR ----------------
 def generate_with_repair(user_input, history):
     error = None
 
-    for _ in range(3):
+    for _ in range(4):
         raw = generate(user_input, history, error)
-        cleaned = clean_yaml_output(raw)
+
+        print("\n=== RAW LLM OUTPUT ===\n", raw)
+
+        # Handle non-ansible text response
+        if "INVALID REQUEST" in raw:
+            return None, raw
+
+        # If it's NOT YAML → treat as chat response
+        if not raw.strip().startswith("- name:"):
+            return None, raw
+
+        cleaned = clean_yaml(raw)
 
         parsed, err = parse_yaml(cleaned)
         if err:
             error = err
             continue
-
-        parsed = sanitize_playbook(parsed, user_input)
 
         final_yaml = yaml.dump(parsed, sort_keys=False)
 
@@ -219,6 +167,7 @@ def agent(user_input):
 
     yaml_text, result = generate_with_repair(user_input, history)
 
+    # TEXT response (chat or invalid)
     if not yaml_text:
         return result
 
@@ -235,3 +184,13 @@ def agent(user_input):
         + "\n\n===== EXECUTION =====\n"
         + run_out
     )
+
+
+# ---------------- CLI LOOP ----------------
+if __name__ == "__main__":
+    print("Ansible AI Agent Ready")
+    while True:
+        user_input = input(">> ")
+        if user_input.lower() in ["exit", "quit"]:
+            break
+        print(agent(user_input))
