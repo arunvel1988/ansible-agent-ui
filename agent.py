@@ -1,5 +1,7 @@
 import subprocess
 import tempfile
+import yaml
+import re
 from langchain_ollama import OllamaLLM
 
 llm = OllamaLLM(model="llama3")
@@ -7,14 +9,10 @@ llm = OllamaLLM(model="llama3")
 chat_history = []
 
 
+# ---------------- CLEAN LLM OUTPUT ----------------
 def clean_yaml_output(text):
-    """
-    Remove markdown fences and surrounding explanation text.
-    Keep only raw YAML starting from first '- name:'.
-    """
     text = text.strip()
 
-    # Remove markdown blocks if present
     if "```" in text:
         parts = text.split("```")
         for part in parts:
@@ -22,218 +20,218 @@ def clean_yaml_output(text):
                 text = part.replace("yaml", "").strip()
                 break
 
-    # Keep only YAML starting from first '- name:'
     if "- name:" in text:
         text = text[text.index("- name:"):]
 
     return text.strip()
 
 
-def fix_common_yaml_issues(yaml_text):
-    """
-    Fix common LLM indentation mistakes for Ansible structure.
-    """
-    lines = yaml_text.splitlines()
-    fixed_lines = []
+# ---------------- INTENT EXTRACTION ----------------
+def extract_user_task(user_input):
+    match = re.search(r"user\s+(\w+)", user_input.lower())
+    username = match.group(1) if match else "testuser"
 
-    inside_tasks = False
+    return {
+        "name": f"Create user {username}",
+        "user": {
+            "name": username,
+            "password": "{{ '123' | password_hash('sha512') }}",
+            "groups": "sudo",
+            "append": True
+        }
+    }
 
-    for line in lines:
-        stripped = line.strip()
 
-        # top-level keys under play
-        if stripped.startswith("hosts:") or stripped.startswith("become:"):
-            fixed_lines.append("  " + stripped)
+# ---------------- SANITIZER ----------------
+def sanitize_playbook(playbook, user_input):
+    play = playbook[0]
+
+    clean_play = {
+        "name": play.get("name", "Play"),
+        "hosts": "localhost",
+        "become": True
+    }
+
+    tasks = play.get("tasks", [])
+    clean_tasks = []
+
+    for task in tasks:
+        if not isinstance(task, dict):
             continue
 
-        if stripped.startswith("tasks:"):
-            fixed_lines.append("  tasks:")
-            inside_tasks = True
-            continue
+        new_task = {"name": task.get("name", "Task")}
 
-        # tasks list item
-        if inside_tasks and stripped.startswith("- name:"):
-            fixed_lines.append("    " + stripped)
-            continue
+        for key, value in task.items():
+            if key == "name":
+                continue
 
-        # task body
-        if inside_tasks and stripped and not stripped.startswith("- name:"):
-            # if already deeply indented, keep it
-            if not line.startswith("      "):
-                fixed_lines.append("      " + stripped)
+            # -------- USER FIX --------
+            if key == "user" and isinstance(value, dict):
+                if "sudo" in value:
+                    value.pop("sudo")
+                    value["groups"] = "sudo"
+                    value["append"] = True
+
+                if "password" in value:
+                    value["password"] = "{{ '123' | password_hash('sha512') }}"
+
+                new_task["user"] = value
+
+            # -------- COMMAND FIX --------
+            elif key in ["command", "shell"]:
+                new_task[key] = value
+                new_task["register"] = "cmd_output"
+
             else:
-                fixed_lines.append(line)
-            continue
+                new_task[key] = value
 
-        fixed_lines.append(line)
+        # keep valid tasks only
+        if len(new_task) > 1:
+            clean_tasks.append(new_task)
 
-    return "\n".join(fixed_lines)
+    # 🚨 NEVER allow empty tasks
+    if not clean_tasks:
+        clean_tasks.append(extract_user_task(user_input))
+
+    # show output if command used
+    if any("command" in t or "shell" in t for t in clean_tasks):
+        clean_tasks.append({
+            "name": "Show command output",
+            "debug": {"var": "cmd_output.stdout"}
+        })
+
+    clean_play["tasks"] = clean_tasks
+
+    return [clean_play]
 
 
-def is_safe(yaml_text):
-    """
-    Block obviously dangerous patterns.
-    """
-    blocked_patterns = [
-        "rm -rf",
-        "shutdown",
-        "reboot",
-        "mkfs",
-        ":(){:|:&};:",
-        "dd if=",
-    ]
+# ---------------- PARSE ----------------
+def parse_yaml(text):
+    try:
+        data = yaml.safe_load(text)
+        if not isinstance(data, list):
+            return None, "Playbook must start with '- name:'"
+        return data, None
+    except Exception as e:
+        return None, str(e)
 
-    lowered = yaml_text.lower()
 
-    for pattern in blocked_patterns:
-        if pattern in lowered:
-            return False, pattern
-
+# ---------------- SAFETY ----------------
+def is_safe(text):
+    blocked = ["rm -rf", "shutdown", "reboot", "mkfs", "dd if="]
+    for b in blocked:
+        if b in text.lower():
+            return False, b
     return True, None
 
 
-def validate_playbook(file_path):
-    """
-    Syntax check generated playbook.
-    """
-    result = subprocess.run(
-        ["ansible-playbook", file_path, "--syntax-check"],
-        capture_output=True,
-        text=True
-    )
-
-    return result.returncode == 0, result.stderr
-
-
-def dry_run_playbook(file_path):
-    """
-    Run Ansible dry-run.
-    """
-    result = subprocess.run(
-        ["ansible-playbook", file_path, "--check"],
-        capture_output=True,
-        text=True
-    )
-
+# ---------------- ANSIBLE ----------------
+def run(cmd):
+    result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout if result.stdout else result.stderr
 
 
-def execute_playbook(file_path):
-    """
-    Execute playbook for real.
-    """
-    result = subprocess.run(
-        ["ansible-playbook", file_path],
-        capture_output=True,
-        text=True
-    )
-
-    return result.stdout if result.stdout else result.stderr
+def validate(path):
+    return run(["ansible-playbook", path, "--syntax-check"])
 
 
-def generate_playbook(user_input, history_context):
-    """
-    Ask LLM to generate raw Ansible YAML only.
-    """
+def dry_run(path):
+    return run(["ansible-playbook", path, "--check"])
+
+
+def execute(path):
+    return run(["ansible-playbook", path])
+
+
+# ---------------- LLM ----------------
+def generate(user_input, history, error=None):
     prompt = f"""
 You are an expert Ansible automation engine.
 
-STRICT OUTPUT RULES:
-- Output ONLY raw YAML
+STRICT:
+- Output ONLY YAML
 - No markdown
-- No ```yaml
-- No explanations
-- No headings
-- Output must begin with: - name:
-
-STRICT STRUCTURE:
-- name: Play Name
-  hosts: localhost
-  become: yes
-
-  tasks:
-    - name: Task Name
-      module_name:
-        key: value
+- Must start with '- name:'
 
 RULES:
-- hosts must always be localhost
-- always include become: yes
-- tasks must be properly indented
-- each task starts with '- name:'
+- Valid modules only
+- Correct parameters
 
-MODULE RULES:
-- apt for package install/remove on Ubuntu
-- service for services
-- file for files/directories
-- user for users
-- command or shell only if absolutely necessary
-
-SAFETY:
-- do not use rm -rf
-- do not format disks
-- do not reboot or shutdown
+IMPORTANT:
+- user module does NOT support sudo
+- use groups: sudo
 
 Conversation:
-{history_context}
+{history}
 
-User request:
+User:
 {user_input}
 """
-    response = llm.invoke(prompt)
-    return response.strip()
+
+    if error:
+        prompt += f"\n\nFix this error:\n{error}"
+
+    return llm.invoke(prompt).strip()
 
 
+# ---------------- AUTO REPAIR LOOP ----------------
+def generate_with_repair(user_input, history):
+    error = None
+
+    for _ in range(3):
+        raw = generate(user_input, history, error)
+        cleaned = clean_yaml_output(raw)
+
+        parsed, err = parse_yaml(cleaned)
+        if err:
+            error = err
+            continue
+
+        parsed = sanitize_playbook(parsed, user_input)
+
+        final_yaml = yaml.dump(parsed, sort_keys=False)
+
+        safe, pattern = is_safe(final_yaml)
+        if not safe:
+            return None, f"Blocked unsafe command: {pattern}"
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".yml", mode="w") as f:
+            f.write(final_yaml)
+            path = f.name
+
+        validation = validate(path)
+
+        if "ERROR" in validation:
+            error = validation
+            continue
+
+        return final_yaml, path
+
+    return None, f"Failed after retries:\n{error}"
+
+
+# ---------------- MAIN AGENT ----------------
 def agent(user_input):
-    """
-    Main entrypoint used by Flask app.
-    """
     global chat_history
 
     chat_history.append(f"User: {user_input}")
-    history_context = "\n".join(chat_history[-6:])
+    history = "\n".join(chat_history[-5:])
 
-    try:
-        yaml_content = generate_playbook(user_input, history_context)
-    except Exception as e:
-        return f"LLM error:\n{str(e)}"
+    yaml_text, result = generate_with_repair(user_input, history)
 
-    # cleanup and repair
-    yaml_content = clean_yaml_output(yaml_content)
-    yaml_content = fix_common_yaml_issues(yaml_content)
+    if not yaml_text:
+        return result
 
-    # safety check
-    safe, pattern = is_safe(yaml_content)
-    if not safe:
-        return f"Blocked unsafe command:\n{pattern}"
+    path = result
 
-    # save temp playbook
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".yml", mode="w") as f:
-        f.write(yaml_content)
-        playbook_path = f.name
+    dry = dry_run(path)
+    run_out = execute(path)
 
-    # syntax validation
-    valid, error = validate_playbook(playbook_path)
-    if not valid:
-        return (
-            "Invalid playbook generated.\n\n"
-            f"Validation error:\n{error}\n\n"
-            f"Generated YAML:\n{yaml_content}"
-        )
-
-    # dry run
-    dry_output = dry_run_playbook(playbook_path)
-
-    # execute
-    exec_output = execute_playbook(playbook_path)
-
-    result = (
-        "--- DRY RUN OUTPUT ---\n"
-        f"{dry_output}\n\n"
-        "--- EXECUTION OUTPUT ---\n"
-        f"{exec_output}"
+    return (
+        "===== FINAL YAML =====\n"
+        + yaml_text
+        + "\n\n===== DRY RUN =====\n"
+        + dry
+        + "\n\n===== EXECUTION =====\n"
+        + run_out
     )
-
-    chat_history.append("Assistant: playbook executed")
-
-    return result
